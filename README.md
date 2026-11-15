@@ -34,6 +34,59 @@ burned in, ready to upload.
 
 ---
 
+## Clipping stack / Tumpukan alat
+
+Stack yang dipakai dan direkomendasikan untuk workflow clipping ini,
+dari [postingan @RoundtableSpace](https://x.com/RoundtableSpace/status/2121630485537255559)
+tentang clipping stack (semua open-source, dicek: aktif dan banyak dipakai):
+
+| Alat | Status di tool ini | Peran |
+|---|---|---|
+| [FFmpeg](https://github.com/FFmpeg/FFmpeg) — 67K ★ | ✅ **Inti / core** | Ekstrak audio, reframe 1080x1920, bakar caption ASS. Semua rendering video di tool ini lewat ffmpeg. |
+| [faster-whisper](https://github.com/SYSTRAN/faster-whisper) | ✅ **Inti / core** (default) | Transkrip + timestamp per kata, CPU-friendly. Bukan dari postingan itu, tapi ini default `--transcriber` di sini. |
+| [WhisperX](https://github.com/m-bain/whisperX) — 25K ★, BSD-2-Clause | ⚙️ **Opsional** — `--transcriber whisperx` | ASR dengan timestamp per kata + speaker diarization (siapa bicara kapan). Alternatif transcriber; output kata-katanya dikonversi ke format yang sama, jadi scoring + caption jalan seperti biasa. |
+| [PySceneDetect](https://github.com/Breakthrough/PySceneDetect) — 5,5K ★ | ⚙️ **Opsional** — `--scene-detect` | Deteksi pergantian scene; titik potong klip di-snap ke batas scene terdekat (±1,5 detik) supaya potongan tidak jatuh di tengah gerakan. |
+| [auto-editor](https://github.com/WyattBlue/auto-editor) — 5,9K ★, Unlicense | 📝 **Opsional, hanya dokumentasi** | Editor video otomatis (mis. buang bagian hening). Tidak ada jalur kode di tool ini — dipakai mandiri sebagai pre-step kalau kamu download videonya sendiri dulu: `auto-editor video.mp4 --margin 0.4s` (cek `auto-editor --help` untuk opsi lain). |
+| [Remotion](https://github.com/remotion-dev/remotion) — 73K ★ | 🔁 **Dipakai di stack lain** | Video programatik dengan React. Dipakai di serial stickman penulis, bukan di CLI ini (caption di sini dibakar langsung oleh ffmpeg). Disebut karena satu ekosistem: kalau butuh template/motion grafis yang lebih rumit, Remotion jalurnya. |
+
+### WhisperX (`--transcriber whisperx`)
+
+```bash
+pip install whisperx   # lihat requirements.txt, bagian opsional
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --transcriber whisperx
+```
+
+Kalau `whisperx` belum terinstal, tool ini **berhenti dengan pesan install
+yang jelas** — tidak diam-diam balik ke faster-whisper, supaya kamu tahu
+persis engine apa yang jalan.
+
+**Diarization (`--diarize`)** — label pembicara per kata (pyannote).
+Butuh token Hugging Face yang kamu set sendiri:
+
+```bash
+export HF_TOKEN="hf_..."   # token kamu sendiri, dengan akses ke model
+                            # pyannote speaker-diarization (terima dulu
+                            # lisensinya di huggingface.co)
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" \
+    --transcriber whisperx --diarize
+```
+
+Tanpa token, tool memberi warning dan lanjut **tanpa** diarization.
+Jangan pernah menulis token ke file atau ke kode.
+
+### Scene detection (`--scene-detect`)
+
+```bash
+pip install scenedetect   # lihat requirements.txt, bagian opsional
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --scene-detect
+```
+
+Kalau `scenedetect` belum terinstal, tool memberi warning dan lanjut
+tanpa snapping (perilaku default tidak berubah). Tidak berpengaruh
+dengan `--timestamps` (rentang manual dipakai apa adanya).
+
+---
+
 ## Skor potensi viral / Viral-potential score
 
 Setiap klip dinilai 0–100 dari sinyal-sinyal ini (dari transkrip + audio):
@@ -101,6 +154,12 @@ python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --num-clips 5 --min-le
 
 # Manual: tentukan sendiri rentang waktunya (menggantikan segmentasi otomatis)
 python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --timestamps "1:05-1:50,3:00-3:45"
+
+# Transkrip dengan WhisperX (timestamp kata + diarization, butuh HF_TOKEN)
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --transcriber whisperx --diarize
+
+# Potongan dirapikan ke batas scene (PySceneDetect)
+python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --scene-detect
 ```
 
 | Opsi / Option | Default | Keterangan |
@@ -109,7 +168,10 @@ python clip.py "https://www.youtube.com/watch?v=VIDEO_ID" --timestamps "1:05-1:5
 | `--min-len` | `30` | Durasi minimum klip (detik) |
 | `--max-len` | `59` | Durasi maksimum klip (detik, Shorts ≤ 60) |
 | `--lang` | `id` | Bahasa transkrip (`id`, `en`, ...) |
-| `--model` | `base` | Model faster-whisper: `tiny`, `base`, `small`, `medium` |
+| `--model` | `base` | Model faster-whisper / WhisperX: `tiny`, `base`, `small`, `medium` |
+| `--transcriber` | `faster-whisper` | Engine transkrip: `faster-whisper` atau `whisperx` |
+| `--diarize` | — | Dengan WhisperX: label pembicara (butuh `HF_TOKEN`) |
+| `--scene-detect` | — | Snap titik potong ke batas scene (PySceneDetect) |
 | `--no-captions` | — | Lewati caption |
 | `--timestamps` | — | Rentang manual `"1:05-1:50,3:00-3:45"` |
 | `--workdir` | `downloads` | Folder video sumber |

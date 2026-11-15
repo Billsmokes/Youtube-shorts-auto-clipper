@@ -8,7 +8,9 @@ word-by-word captions, ready to upload.
 
 Pipeline:
     1. Download with yt-dlp (best video+audio, mp4, max 1080p).
-    2. Transcribe with faster-whisper (word timestamps, CPU-friendly).
+    2. Transcribe with faster-whisper (word timestamps, CPU-friendly),
+       or optionally WhisperX (--transcriber whisperx) for word
+       timestamps + speaker diarization (--diarize, needs HF_TOKEN).
     3. Segment into candidate clips (30-59s by default) using transcript
        gaps, ranked by a VIRAL-POTENTIAL score: hook in the first 3s,
        energy peaks, strong/emotional statements, payoff inside the clip,
@@ -17,6 +19,8 @@ Pipeline:
        The score is a HEURISTIC only — it finds moments with higher viral
        potential; it never guarantees views. Real virality also depends on
        the algorithm, timing, audience and luck.
+       With --scene-detect, cut points are snapped to the nearest
+       PySceneDetect scene boundary (within ~1.5s).
     4. Reframe to 1080x1920 (center crop) and burn in karaoke-style
        word-by-word captions (ASS subtitles) with ffmpeg.
     5. Write output/clip_01.mp4 ... + clips.json manifest.
@@ -24,6 +28,8 @@ Pipeline:
 Usage:
     python clip.py <youtube_url> [--num-clips 3] [--min-len 30] [--max-len 59]
                [--lang id] [--model base] [--no-captions]
+               [--transcriber faster-whisper|whisperx] [--diarize]
+               [--scene-detect]
                [--timestamps "1:05-1:50,3:00-3:45"]
 
 Only use videos you own or that are public-domain / Creative Commons.
@@ -240,6 +246,131 @@ def transcribe(path, model_name, lang, workdir):
     return words, (times, rms)
 
 
+def transcribe_whisperx(path, model_name, lang, workdir, diarize=False):
+    """Transcribe with WhisperX. Returns (words, energy) in the same
+    format as transcribe(): a list of {"start", "end", "word"} dicts plus
+    the (times, rms) loudness windows for viral scoring.
+
+    WhisperX adds word-level timestamps via its alignment step and,
+    with --diarize, speaker labels via pyannote diarization.
+
+    If whisperx is NOT installed this exits with a clear install hint —
+    it never silently falls back to faster-whisper, so the user knows
+    exactly what the chosen engine needs.
+    """
+    try:
+        import whisperx
+    except ImportError:
+        print("ERROR: --transcriber whisperx needs the whisperx package, "
+              "which is not installed.")
+        print("       pip install whisperx   (optional section of "
+              "requirements.txt)")
+        print("       Or drop --transcriber whisperx to use faster-whisper.")
+        raise SystemExit(2)
+    print(f"[2/5] Transcribing (whisperx {model_name}, lang={lang}) ...")
+    audio = extract_audio_array(path, workdir)
+    times, rms = energy_curve(audio)
+    device = "cpu"
+    model = whisperx.load_model(model_name, device, compute_type="int8")
+    result = model.transcribe(audio, language=lang, batch_size=8)
+    # Word-level timestamps come from the alignment step.
+    try:
+        model_a, metadata = whisperx.load_align_model(
+            language_code=lang, device=device)
+        result = whisperx.align(result["segments"], model_a, metadata,
+                                audio, device)
+    except Exception as exc:  # noqa: BLE001 - fall back to raw words
+        print(f"      WARNING: WhisperX alignment failed ({exc}); "
+              "using the raw transcription words if they carry timestamps.")
+    if diarize:
+        import os
+        token = (os.environ.get("HF_TOKEN")
+                 or os.environ.get("HUGGINGFACE_TOKEN"))
+        if not token:
+            print("      WARNING: --diarize needs a Hugging Face token "
+                  "(set HF_TOKEN) for the pyannote diarization model; "
+                  "continuing without speaker labels.")
+        else:
+            try:
+                diarize_model = whisperx.DiarizationPipeline(
+                    use_auth_token=token, device=device)
+                diarize_segments = diarize_model(audio)
+                result = whisperx.assign_word_speakers(
+                    diarize_segments, result)
+            except Exception as exc:  # noqa: BLE001 - diarization is extra
+                print(f"      WARNING: diarization failed ({exc}); "
+                      "continuing without speaker labels.")
+    words = []
+    for seg in result["segments"]:
+        for w in (seg.get("words") or []):
+            text = (w.get("word") or "").strip()
+            if text and "start" in w and "end" in w:
+                words.append({"start": float(w["start"]),
+                              "end": float(w["end"]), "word": text})
+    if not words:
+        print("ERROR: WhisperX returned no word-level timestamps. "
+              "The alignment step may not support this language — "
+              "try --transcriber faster-whisper instead.")
+        raise SystemExit(2)
+    print(f"      {len(words)} words recognised")
+    return words, (times, rms)
+
+
+# --------------------------------------------------------------------------
+# 2b. scene detection (optional, PySceneDetect)
+# --------------------------------------------------------------------------
+
+SCENE_SNAP_TOL = 1.5  # seconds: snap a cut point only this close to a scene
+
+
+def detect_scenes(path):
+    """Detect scene boundaries with PySceneDetect. Returns a sorted list
+    of boundary times in seconds (start of every scene after the first),
+    or None when scenedetect is not installed — the caller then continues
+    without snapping (warning printed, no error)."""
+    try:
+        from scenedetect import open_video, SceneManager
+        from scenedetect.detectors import ContentDetector
+    except ImportError:
+        print("      WARNING: --scene-detect needs the scenedetect package, "
+              "which is not installed.")
+        print("               pip install scenedetect   (optional section "
+              "of requirements.txt)")
+        print("               Continuing without scene snapping.")
+        return None
+    print("      Detecting scenes with PySceneDetect ...")
+    video = open_video(str(path))
+    manager = SceneManager()
+    manager.add_detector(ContentDetector())
+    manager.detect_scenes(video)
+    scenes = manager.get_scene_list()
+    boundaries = sorted(s[0].get_seconds() for s in scenes[1:])
+    print(f"      {len(scenes)} scenes found")
+    return boundaries
+
+
+def _snap_cuts_to_scenes(cuts, scenes, duration):
+    """Snap interior cut points to the nearest scene boundary when one is
+    within SCENE_SNAP_TOL seconds, so a clip never starts/ends mid-motion.
+    0.0 and the video end never move."""
+    if not scenes:
+        return cuts
+    snapped, moved = [], 0
+    for p in cuts:
+        if p == 0.0 or p == duration:
+            snapped.append(p)
+            continue
+        nearest = min(scenes, key=lambda s: abs(s - p))
+        if abs(nearest - p) <= SCENE_SNAP_TOL:
+            snapped.append(round(nearest, 3))
+            moved += 1
+        else:
+            snapped.append(p)
+    if moved:
+        print(f"      snapped {moved} cut point(s) to scene boundaries")
+    return sorted(set(snapped))
+
+
 # --------------------------------------------------------------------------
 # 3. segmentation
 # --------------------------------------------------------------------------
@@ -389,12 +520,16 @@ def score_clip(words, start, end, energy):
     return max(0, min(100, int(round(score))))
 
 
-def segment_auto(words, duration, min_len, max_len, num_clips, energy):
+def segment_auto(words, duration, min_len, max_len, num_clips, energy,
+                 scenes=None):
     """Candidate clips from transcript gaps, ranked by viral-potential
-    score (hook + energy + statements + payoff + speech density)."""
+    score (hook + energy + statements + payoff + speech density).
+    With scenes given, cut points snap to the nearest scene boundary."""
     if not words:
         return []
     cuts = _cut_points(words, duration)
+    if scenes:
+        cuts = _snap_cuts_to_scenes(cuts, scenes, duration)
     candidates = []
     for start in cuts:
         # latest cut point that keeps the clip within [min_len, max_len]
@@ -566,8 +701,19 @@ def main(argv=None):
     ap.add_argument("--lang", default="id",
                     help="transcription language code, e.g. id, en (default: id)")
     ap.add_argument("--model", default="base",
-                    help="faster-whisper model: tiny, base, small, medium "
-                         "(default: base)")
+                    help="faster-whisper / WhisperX model: tiny, base, small, "
+                         "medium (default: base)")
+    ap.add_argument("--transcriber", default="faster-whisper",
+                    choices=["faster-whisper", "whisperx"],
+                    help="transcription engine: faster-whisper (default) or "
+                         "whisperx (word timestamps + optional diarization)")
+    ap.add_argument("--diarize", action="store_true",
+                    help="with --transcriber whisperx: add speaker labels "
+                         "via pyannote diarization (needs HF_TOKEN set)")
+    ap.add_argument("--scene-detect", action="store_true",
+                    help="snap clip cut points to PySceneDetect scene "
+                         "boundaries (needs scenedetect installed; "
+                         "ignored with --timestamps)")
     ap.add_argument("--no-captions", action="store_true",
                     help="skip burned-in captions")
     ap.add_argument("--timestamps",
@@ -595,10 +741,26 @@ def main(argv=None):
     duration = ffprobe_duration(src)
     print(f"      duration {fmt_time(duration)}")
 
+    # 2a. optional scene boundaries (used to snap cut points below)
+    scenes = None
+    if args.scene_detect:
+        if args.timestamps:
+            print("      NOTE: --scene-detect has no effect with "
+                  "--timestamps (manual ranges are used as-is).")
+        else:
+            scenes = detect_scenes(src)
+
     # 2. transcribe (skip when manual ranges + no captions)
     need_transcript = not (args.timestamps and args.no_captions)
     if need_transcript:
-        words, energy = transcribe(src, args.model, args.lang, workdir)
+        if args.transcriber == "whisperx":
+            words, energy = transcribe_whisperx(
+                src, args.model, args.lang, workdir, diarize=args.diarize)
+        else:
+            if args.diarize:
+                print("      WARNING: --diarize only applies to "
+                      "--transcriber whisperx; ignoring.")
+            words, energy = transcribe(src, args.model, args.lang, workdir)
         (out_dir / "transcript.json").write_text(
             json.dumps(words, indent=2, ensure_ascii=False), encoding="utf-8")
     else:
@@ -627,7 +789,8 @@ def main(argv=None):
         clips = clips[: args.num_clips]
     else:
         clips = segment_auto(words, duration, args.min_len,
-                             args.max_len, args.num_clips, energy)
+                             args.max_len, args.num_clips, energy,
+                             scenes=scenes)
         if not clips:
             if words:
                 print("      no good speech segments found, "
@@ -655,6 +818,8 @@ def main(argv=None):
         "source_duration_sec": round(duration, 1),
         "model": args.model,
         "lang": args.lang,
+        "transcriber": args.transcriber,
+        "scene_detect": bool(scenes),
         "captions": not args.no_captions,
         "scoring": ("viral-potential score 0-100: a heuristic based on "
                     "hook, energy, statements and payoff. It ranks moments "

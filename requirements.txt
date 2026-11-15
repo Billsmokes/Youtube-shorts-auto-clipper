@@ -1,3 +1,16 @@
 yt-dlp>=2024.1.1
 faster-whisper>=1.0.0
 numpy>=1.26
+
+# --- Optional: alternative transcriber + scene detection -------------------
+# Uncomment to enable:
+#   python clip.py <url> --transcriber whisperx [--diarize]
+#   python clip.py <url> --scene-detect
+# These stay optional on purpose — the default install stays light and
+# CPU-friendly (faster-whisper + ffmpeg only).
+# whisperx>=3.0
+# scenedetect>=0.6
+# NOTE --diarize (speaker labels with WhisperX) needs a Hugging Face token:
+# set HF_TOKEN yourself in the environment, with access to the pyannote
+# speaker-diarization models (accept their licences on huggingface.co).
+# Never put the token in this file or in the code.
